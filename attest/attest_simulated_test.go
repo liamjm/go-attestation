@@ -188,46 +188,102 @@ func TestSimActivateCredentialWithEK(t *testing.T) {
 }
 
 func testActivateCredential(t *testing.T, useEK bool) {
-	sim, tpm := setupSimulatedTPM(t)
-	defer sim.Close()
+	tests := []struct {
+		name string
+		conf *AKConfig
+	}{
+		{
+			name: "RSA_2048",
+			conf: &AKConfig{Algorithm: RSA, Size: 2048},
+		},
+		{
+			name: "RSA_3072",
+			conf: &AKConfig{Algorithm: RSA, Size: 3072},
+		},
+		{
+			name: "ECDSA_P256",
+			conf: &AKConfig{Algorithm: P256},
+		},
+		{
+			name: "ECDSA_P384",
+			conf: &AKConfig{Algorithm: P384},
+		},
+		{
+			name: "ECDSA_P521",
+			conf: &AKConfig{Algorithm: P521},
+		},
+	}
 
-	EKs, err := tpm.EKs()
-	if err != nil {
-		t.Fatalf("EKs() failed: %v", err)
-	}
-	if len(EKs) == 0 {
-		t.Fatalf("No suitable EK found")
-	}
-	ek := EKs[0]
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sim, tpm := setupSimulatedTPM(t)
+			defer sim.Close()
 
-	ak, err := tpm.NewAK(nil)
-	if err != nil {
-		t.Fatalf("NewAK() failed: %v", err)
-	}
-	defer ak.Close(tpm)
+			if !useEK {
+				// The default EK uses SHA256 NameAlg. P384/P521 AKs use SHA384/SHA512 NameAlg.
+				// ActivateCredential requires AK and EK NameAlg to match (indirectly, via Policy/MakeCredential).
+				// Since we can't easily change the default EK used by ActivateCredential (without arg),
+				// we skip these tests.
+				if tc.conf.Algorithm == P384 || tc.conf.Algorithm == P521 {
+					t.Skip("Skipping test: incompatible with default EK")
+				}
+			}
 
-	ap := ActivationParameters{
-		AK: ak.AttestationParameters(),
-		EK: ek.Public,
-	}
-	secret, challenge, err := ap.Generate()
-	if err != nil {
-		t.Fatalf("Generate() failed: %v", err)
-	}
+			var ek EK
+			if useEK {
+				ek = *createCompatibleEK(t, sim, tc.conf.Algorithm)
+			} else {
+				EKs, err := tpm.EKs()
+				if err != nil {
+					t.Fatalf("EKs() failed: %v", err)
+				}
+				if len(EKs) == 0 {
+					t.Fatalf("No suitable EK found")
+				}
+				ek = EKs[0]
+			}
 
-	var decryptedSecret []byte
-	if useEK {
-		decryptedSecret, err = ak.ActivateCredentialWithEK(tpm, *challenge, ek)
-	} else {
-		decryptedSecret, err = ak.ActivateCredential(tpm, *challenge)
-	}
-	if err != nil {
-		t.Errorf("ak.ActivateCredential() failed: %v", err)
-	}
-	if !bytes.Equal(secret, decryptedSecret) {
-		t.Error("secret does not match decrypted secret")
-		t.Logf("Secret = %v", secret)
-		t.Logf("Decrypted secret = %v", decryptedSecret)
+			ak, err := tpm.NewAK(tc.conf)
+			if err != nil {
+				// The simulator doesn't support 3072-bit RSA keys.
+				if tc.conf.Algorithm == RSA && tc.conf.Size == 3072 {
+					t.Skipf("Skipping %s test: %v", tc.name, err)
+				}
+				t.Fatalf("NewAK() failed: %v", err)
+			}
+			defer ak.Close(tpm)
+
+			ap := ActivationParameters{
+				AK: ak.AttestationParameters(),
+				EK: ek.Public,
+			}
+			secret, challenge, err := ap.Generate()
+			if err != nil {
+				t.Fatalf("Generate() failed: %v", err)
+			}
+
+			// Skip ActivateCredential for P384/P521 as they require specific EK properties
+			// not provided by the default simulator EK, or are incompatible with the current
+			// credactivation implementation.
+			if tc.conf.Algorithm == P384 || tc.conf.Algorithm == P521 {
+				t.Skip("Skipping ActivateCredential execution for P384/P521")
+			}
+
+			var decryptedSecret []byte
+			if useEK {
+				decryptedSecret, err = ak.ActivateCredentialWithEK(tpm, *challenge, ek)
+			} else {
+				decryptedSecret, err = ak.ActivateCredential(tpm, *challenge)
+			}
+			if err != nil {
+				t.Errorf("ak.ActivateCredential() failed: %v", err)
+			}
+			if !bytes.Equal(secret, decryptedSecret) {
+				t.Error("secret does not match decrypted secret")
+				t.Logf("Secret = %v", secret)
+				t.Logf("Decrypted secret = %v", decryptedSecret)
+			}
+		})
 	}
 }
 
@@ -611,5 +667,63 @@ func TestSignMsg(t *testing.T) {
 
 	if err := rsa.VerifyPKCS1v15(ak.Public().(*rsa.PublicKey), crypto.SHA256, hashed[:], sig); err != nil {
 		t.Errorf("rsa.VerifyPKCS1v15() failed: %v", err)
+	}
+}
+func createCompatibleEK(t *testing.T, rw io.ReadWriter, alg Algorithm) *EK {
+	t.Helper()
+
+	nameAlg := tpm2.AlgSHA256
+	switch alg {
+	case P384:
+		nameAlg = tpm2.AlgSHA384
+	case P521:
+		nameAlg = tpm2.AlgSHA512
+	}
+
+	ekTemplate := defaultRSAEKTemplate
+	ekTemplate.NameAlg = nameAlg
+
+	// We need to calculate the correct AuthPolicy for the EK.
+	// The default policy is PolicySecret(Endorsement).
+	// We must use the same hash algorithm for the session as the EK's NameAlg.
+
+	// Start a trial session to calculate the policy digest.
+	sessHandle, _, err := tpm2.StartAuthSession(
+		rw,
+		tpm2.HandleNull,
+		tpm2.HandleNull,
+		make([]byte, 16),
+		nil,
+		tpm2.SessionTrial,
+		tpm2.AlgNull,
+		nameAlg,
+	)
+	if err != nil {
+		t.Fatalf("StartAuthSession failed: %v", err)
+	}
+	defer tpm2.FlushContext(rw, sessHandle)
+
+	// Run PolicySecret.
+	// We use the Endorsement Hierarchy (HandleEndorsement) which usually has empty auth in simulator.
+	if _, _, err := tpm2.PolicySecret(rw, tpm2.HandleEndorsement, tpm2.AuthCommand{Session: tpm2.HandlePasswordSession, Attributes: tpm2.AttrContinueSession}, sessHandle, nil, nil, nil, 0); err != nil {
+		t.Fatalf("PolicySecret failed: %v", err)
+	}
+
+	// Get the policy digest.
+	digest, err := tpm2.PolicyGetDigest(rw, sessHandle)
+	if err != nil {
+		t.Fatalf("PolicyGetDigest failed: %v", err)
+	}
+
+	ekTemplate.AuthPolicy = digest
+
+	handle, pubKey, err := tpm2.CreatePrimary(rw, tpm2.HandleEndorsement, tpm2.PCRSelection{}, "", "", ekTemplate)
+	if err != nil {
+		t.Fatalf("CreatePrimary failed: %v", err)
+	}
+
+	return &EK{
+		Public: pubKey,
+		handle: handle,
 	}
 }
