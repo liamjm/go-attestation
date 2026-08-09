@@ -486,11 +486,11 @@ func templateFromConfig(opts *KeyConfig) (tpm2.Public, error) {
 			tmpl.ECCParameters.Sign.Hash = tpm2.AlgSHA256
 			tmpl.ECCParameters.CurveID = tpm2.CurveNISTP256
 		case 384:
-			tmpl.NameAlg = tpm2.AlgSHA384
-			tmpl.ECCParameters.Sign.Hash = tpm2.AlgSHA384
+			tmpl.NameAlg = tpm2.AlgSHA256
+			tmpl.ECCParameters.Sign.Hash = tpm2.AlgSHA256
 			tmpl.ECCParameters.CurveID = tpm2.CurveNISTP384
 		case 521:
-			tmpl.NameAlg = tpm2.AlgSHA512
+			tmpl.NameAlg = tpm2.AlgSHA256
 			tmpl.ECCParameters.Sign.Hash = tpm2.AlgSHA512
 			tmpl.ECCParameters.CurveID = tpm2.CurveNISTP521
 		default:
@@ -709,6 +709,12 @@ func (k *wrappedKey20) activateCredential(tb tpmBase, in EncryptedCredential, ek
 		return nil, err
 	}
 
+	// We need to determine the NameAlg of the EK to start a session with a compatible hash algorithm.
+	pub, _, _, err := tpm2.ReadPublic(t.rwc, ekHnd)
+	if err != nil {
+		return nil, fmt.Errorf("reading EK public: %v", err)
+	}
+
 	sessHandle, _, err := tpm2.StartAuthSession(
 		t.rwc,
 		tpm2.HandleNull,  /*tpmKey*/
@@ -717,7 +723,7 @@ func (k *wrappedKey20) activateCredential(tb tpmBase, in EncryptedCredential, ek
 		nil,              /*secret*/
 		tpm2.SessionPolicy,
 		tpm2.AlgNull,
-		tpm2.AlgSHA256)
+		pub.NameAlg)
 	if err != nil {
 		return nil, fmt.Errorf("creating session: %v", err)
 	}
@@ -915,4 +921,87 @@ func (k *wrappedKey20) algorithm() (Algorithm, error) {
 	default:
 		return "", fmt.Errorf("unsupported key type: %v", tpmPub.Type)
 	}
+}
+
+func akTemplateFromConfig(opts *AKConfig) (tpm2.Public, error) {
+	var tmpl tpm2.Public
+	var alg Algorithm
+	var size int
+
+	if opts != nil {
+		alg = opts.Algorithm
+		size = opts.Size
+	}
+
+	if alg == "" {
+		alg = RSA
+	}
+	if size == 0 {
+		size = alg.Size()
+	}
+
+	switch alg {
+	case RSA:
+		tmpl = akTemplateRSA
+		// Deep copy RSAParameters to avoid mutating global template.
+		if tmpl.RSAParameters != nil {
+			rsaParams := *tmpl.RSAParameters
+			tmpl.RSAParameters = &rsaParams
+			if tmpl.RSAParameters.Sign != nil {
+				sig := *tmpl.RSAParameters.Sign
+				tmpl.RSAParameters.Sign = &sig
+			}
+		}
+		if size != 0 {
+			if size < 0 || size > 65535 {
+				return tmpl, fmt.Errorf("incorrect size parameter")
+			}
+			tmpl.RSAParameters.KeyBits = uint16(size)
+		}
+
+	case ECDSA, P256, P384, P521:
+		tmpl = akTemplateECC
+		// Deep copy ECCParameters to avoid mutating global template.
+		if tmpl.ECCParameters != nil {
+			eccParams := *tmpl.ECCParameters
+			tmpl.ECCParameters = &eccParams
+			if tmpl.ECCParameters.Sign != nil {
+				sig := *tmpl.ECCParameters.Sign
+				tmpl.ECCParameters.Sign = &sig
+			}
+		}
+
+		switch size {
+		case 256:
+			tmpl.NameAlg = tpm2.AlgSHA256
+			tmpl.ECCParameters.Sign.Hash = tpm2.AlgSHA256
+			tmpl.ECCParameters.CurveID = tpm2.CurveNISTP256
+			tmpl.ECCParameters.Point = tpm2.ECPoint{
+				XRaw: make([]byte, 32),
+				YRaw: make([]byte, 32),
+			}
+		case 384:
+			tmpl.NameAlg = tpm2.AlgSHA384
+			tmpl.ECCParameters.Sign.Hash = tpm2.AlgSHA384
+			tmpl.ECCParameters.CurveID = tpm2.CurveNISTP384
+			tmpl.ECCParameters.Point = tpm2.ECPoint{
+				XRaw: make([]byte, 48),
+				YRaw: make([]byte, 48),
+			}
+		case 521:
+			tmpl.NameAlg = tpm2.AlgSHA512
+			tmpl.ECCParameters.Sign.Hash = tpm2.AlgSHA512
+			tmpl.ECCParameters.CurveID = tpm2.CurveNISTP521
+			tmpl.ECCParameters.Point = tpm2.ECPoint{
+				XRaw: make([]byte, 66),
+				YRaw: make([]byte, 66),
+			}
+		default:
+			return tmpl, fmt.Errorf("unsupported key size: %v", size)
+		}
+	default:
+		return tmpl, fmt.Errorf("unsupported algorithm type: %q", alg)
+	}
+
+	return tmpl, nil
 }

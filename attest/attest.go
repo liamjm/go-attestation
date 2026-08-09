@@ -196,6 +196,9 @@ type AKConfig struct {
 
 	// If not specified, the default algorithm (RSA) is assumed.
 	Algorithm Algorithm
+
+	// Size is used to specify the bit size of the key or elliptic curve.
+	Size int
 }
 
 // EncryptedCredential represents encrypted parameters which must be activated
